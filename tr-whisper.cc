@@ -20,7 +20,6 @@ struct Whisper_Transcribe_System {
   std::string prompt;
   bool include_segments = true;
 
-  // Talkgroup filters
   std::vector<boost::regex> tg_allow;
   std::vector<boost::regex> tg_deny;
   std::vector<std::string> tg_allow_raw;
@@ -28,10 +27,12 @@ struct Whisper_Transcribe_System {
 };
 
 struct Whisper_Transcribe_Data {
-  std::string server;     // ex: http://127.0.0.1:8000/v1/audio/transcriptions
-  std::string api_key;    // optional for some local services
-  std::string model;      // ex: whisper-1 or any compatible model name
+  std::string server;
+  std::string api_key;
+  std::string model;
+  std::string response_format;
   int timeout_seconds = 300;
+  std::string audio_source = "wav";
 
   std::vector<Whisper_Transcribe_System> systems;
 };
@@ -44,9 +45,47 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
 class Whisper_Transcribe : public Plugin_Api {
   Whisper_Transcribe_Data data;
   std::string plugin_name;
+  std::string log_prefix = "\t[Whisper Transcribe]\t";
 
 private:
-  static std::string glob_to_regex_str(const std::string& glob) {
+  void log_plugin_info(const std::string &msg) const {
+    BOOST_LOG_TRIVIAL(info) << log_prefix << msg;
+  }
+
+  void log_plugin_warn(const std::string &msg) const {
+    BOOST_LOG_TRIVIAL(warning) << log_prefix << "\033[0;33m" << msg << "\033[0m";
+  }
+
+  void log_plugin_error(const std::string &msg) const {
+    BOOST_LOG_TRIVIAL(error) << log_prefix << "\033[0;31m" << msg << "\033[0m";
+  }
+
+  std::string build_loghdr(const Call_Data_t &call_info) const {
+    return log_header(call_info.short_name,
+                      call_info.call_num,
+                      call_info.talkgroup_display,
+                      call_info.freq);
+  }
+
+  void log_call_info(const Call_Data_t &call_info, const std::string &msg) const {
+    BOOST_LOG_TRIVIAL(info) << build_loghdr(call_info) << msg;
+  }
+
+  void log_call_warn(const Call_Data_t &call_info, const std::string &msg) const {
+    BOOST_LOG_TRIVIAL(warning) << build_loghdr(call_info)
+                               << "\033[0;33m" << msg << "\033[0m";
+  }
+
+  void log_call_error(const Call_Data_t &call_info, const std::string &msg) const {
+    BOOST_LOG_TRIVIAL(error) << build_loghdr(call_info)
+                             << "\033[0;31m" << msg << "\033[0m";
+  }
+
+  static std::string bool_to_string(bool value) {
+    return value ? "true" : "false";
+  }
+
+  static std::string glob_to_regex_str(const std::string &glob) {
     std::string rx;
     rx.reserve(glob.size() * 2);
     rx += "^";
@@ -72,8 +111,8 @@ private:
     return rx;
   }
 
-  static bool match_any(const std::string& value, const std::vector<boost::regex>& patterns) {
-    for (const auto& r : patterns) {
+  static bool match_any(const std::string &value, const std::vector<boost::regex> &patterns) {
+    for (const auto &r : patterns) {
       if (boost::regex_match(value, r)) {
         return true;
       }
@@ -81,7 +120,7 @@ private:
     return false;
   }
 
-  static bool passes_talkgroup_filter(const Whisper_Transcribe_System* sys, uint32_t talkgroup) {
+  static bool passes_talkgroup_filter(const Whisper_Transcribe_System *sys, uint32_t talkgroup) {
     if (!sys) return true;
 
     const std::string tg = std::to_string(talkgroup);
@@ -98,25 +137,27 @@ private:
   }
 
   static void compile_patterns_from_json(
-      const json& parent,
-      const char* key,
-      std::vector<boost::regex>& out_compiled,
-      std::vector<std::string>& out_raw,
-      const std::string& log_prefix,
-      const std::string& sys_short_name) {
+      const json &parent,
+      const char *key,
+      std::vector<boost::regex> &out_compiled,
+      std::vector<std::string> &out_raw,
+      const std::string &log_prefix,
+      const std::string &sys_short_name) {
     out_compiled.clear();
     out_raw.clear();
 
     if (!parent.contains(key)) return;
-    const auto& j = parent.at(key);
+    const auto &j = parent.at(key);
 
     if (!j.is_array()) {
-      BOOST_LOG_TRIVIAL(error) << log_prefix << sys_short_name
-                               << " " << key << " must be an array";
+      BOOST_LOG_TRIVIAL(error) << log_prefix << "\033[0;31m"
+                               << sys_short_name << " " << key
+                               << " must be an array"
+                               << "\033[0m";
       return;
     }
 
-    for (const auto& v : j) {
+    for (const auto &v : j) {
       std::string pat;
 
       if (v.is_string()) {
@@ -133,16 +174,83 @@ private:
       try {
         out_raw.push_back(pat);
         out_compiled.emplace_back(glob_to_regex_str(pat));
-      } catch (const boost::regex_error& e) {
-        BOOST_LOG_TRIVIAL(error) << log_prefix << sys_short_name
+      } catch (const boost::regex_error &e) {
+        BOOST_LOG_TRIVIAL(error) << log_prefix << "\033[0;31m"
+                                 << sys_short_name
                                  << " invalid pattern in " << key
-                                 << " value='" << pat << "' : " << e.what();
+                                 << " value='" << pat << "' : " << e.what()
+                                 << "\033[0m";
       }
     }
   }
 
-public:
+  static bool is_whisper_1(const std::string &model) {
+    return model == "whisper-1";
+  }
 
+  static bool is_gpt4o_transcribe(const std::string &model) {
+    return model == "gpt-4o-transcribe" || model == "gpt-4o-mini-transcribe";
+  }
+
+  static bool is_gpt4o_diarize(const std::string &model) {
+    return model == "gpt-4o-transcribe-diarize";
+  }
+
+  static bool is_known_openai_model(const std::string &model) {
+    return is_whisper_1(model) || is_gpt4o_transcribe(model) || is_gpt4o_diarize(model);
+  }
+
+  static std::string default_response_format_for_model(const std::string &model) {
+    if (is_whisper_1(model)) {
+      return "verbose_json";
+    }
+    if (is_gpt4o_transcribe(model)) {
+      return "json";
+    }
+    if (is_gpt4o_diarize(model)) {
+      return "diarized_json";
+    }
+
+    // Preserve backward compatibility for local/custom Whisper-like servers.
+    return "verbose_json";
+  }
+
+  static bool response_format_supported_for_model(const std::string &model,
+                                                  const std::string &response_format) {
+    if (is_whisper_1(model)) {
+      return response_format == "json" ||
+             response_format == "text" ||
+             response_format == "srt" ||
+             response_format == "verbose_json" ||
+             response_format == "vtt";
+    }
+
+    if (is_gpt4o_transcribe(model)) {
+      // Docs are a bit inconsistent about text; json is the safest option.
+      return response_format == "json" || response_format == "text";
+    }
+
+    if (is_gpt4o_diarize(model)) {
+      return response_format == "json" ||
+             response_format == "text" ||
+             response_format == "diarized_json";
+    }
+
+    // Unknown local/custom models: trust the caller.
+    return true;
+  }
+
+  static bool prompt_supported_for_model(const std::string &model) {
+    return !is_gpt4o_diarize(model);
+  }
+
+  static bool response_is_json_format(const std::string &response_format) {
+    return response_format == "json" ||
+           response_format == "verbose_json" ||
+           response_format == "diarized_json";
+  }
+
+public:
   static boost::shared_ptr<Whisper_Transcribe> create() {
     return boost::shared_ptr<Whisper_Transcribe>(new Whisper_Transcribe());
   }
@@ -158,24 +266,59 @@ public:
 
   int parse_config(json config_data) override {
     plugin_name = config_data.value("name", "whisper_transcribe");
-    std::string log_prefix = "\t[Whisper Transcribe]\t";
 
     data.server = config_data.value("server", "");
     data.api_key = config_data.value("apiKey", "");
     data.model = config_data.value("model", "whisper-1");
+    data.audio_source = config_data.value("audioSource", "wav");
     data.timeout_seconds = config_data.value("timeoutSeconds", 300);
+
+    if (config_data.contains("responseFormat")) {
+      data.response_format = config_data.value("responseFormat", "");
+    } else {
+      data.response_format = "";
+    }
+
+    boost::algorithm::trim(data.audio_source);
+    boost::algorithm::to_lower(data.audio_source);
+
+    if (data.audio_source != "wav" && data.audio_source != "m4a") {
+      log_plugin_warn("Invalid audioSource '" + data.audio_source + "'; falling back to wav");
+      data.audio_source = "wav";
+    }
 
     boost::algorithm::trim(data.server);
     boost::algorithm::trim(data.api_key);
     boost::algorithm::trim(data.model);
+    boost::algorithm::trim(data.response_format);
+    boost::algorithm::to_lower(data.response_format);
 
     if (data.server.empty()) {
-      BOOST_LOG_TRIVIAL(error) << log_prefix << "server is required";
+      log_plugin_error("server is required");
       return 1;
     }
 
+    if (data.response_format.empty()) {
+      data.response_format = default_response_format_for_model(data.model);
+    }
+
+    if (!response_format_supported_for_model(data.model, data.response_format)) {
+      const std::string fallback = default_response_format_for_model(data.model);
+
+      if (is_known_openai_model(data.model)) {
+        log_plugin_warn("responseFormat '" + data.response_format +
+                        "' is not supported for model '" + data.model +
+                        "'; falling back to '" + fallback + "'");
+        data.response_format = fallback;
+      } else {
+        log_plugin_warn("responseFormat '" + data.response_format +
+                        "' may not be supported by custom model '" + data.model +
+                        "'; keeping configured value");
+      }
+    }
+
     if (!config_data.contains("systems") || !config_data["systems"].is_array()) {
-      BOOST_LOG_TRIVIAL(error) << log_prefix << "systems array is required";
+      log_plugin_error("systems array is required");
       return 1;
     }
 
@@ -187,54 +330,68 @@ public:
       sys.prompt = element.value("prompt", "");
       sys.include_segments = element.value("includeSegments", true);
 
-      compile_patterns_from_json(
-        element, "talkgroupAllow",
-        sys.tg_allow, sys.tg_allow_raw,
-        log_prefix, sys.short_name
-        );
+      boost::algorithm::trim(sys.short_name);
+      boost::algorithm::trim(sys.language);
+      boost::algorithm::trim(sys.prompt);
+
+      if (!prompt_supported_for_model(data.model) && !sys.prompt.empty()) {
+        log_plugin_warn("Prompt is not supported for model '" + data.model +
+                        "'; ignoring prompt for system " + sys.short_name);
+        sys.prompt.clear();
+      }
 
       compile_patterns_from_json(
-        element, "talkgroupDeny",
-        sys.tg_deny, sys.tg_deny_raw,
-        log_prefix, sys.short_name
-        );
+          element, "talkgroupAllow",
+          sys.tg_allow, sys.tg_allow_raw,
+          log_prefix, sys.short_name);
+
+      compile_patterns_from_json(
+          element, "talkgroupDeny",
+          sys.tg_deny, sys.tg_deny_raw,
+          log_prefix, sys.short_name);
 
       if (sys.short_name.empty()) {
-        BOOST_LOG_TRIVIAL(error) << log_prefix << "systems entry missing shortName";
+        log_plugin_error("systems entry missing shortName");
         return 1;
       }
 
       if (sys.enabled) {
-        BOOST_LOG_TRIVIAL(info) << log_prefix
-                                << "Configured system: " << sys.short_name
-                                << "\t includeSegments=" << sys.include_segments;
+        log_plugin_info("Configured System:      " + sys.short_name);
+        log_plugin_info("  Include Segments:    " + bool_to_string(sys.include_segments));
+        log_plugin_info("  Language:            " + (sys.language.empty() ? "[auto]" : sys.language));
+        log_plugin_info("  Prompt:              " + (sys.prompt.empty() ? "[none]" : sys.prompt));
 
         if (!sys.tg_allow_raw.empty() || !sys.tg_deny_raw.empty()) {
-          BOOST_LOG_TRIVIAL(info) << log_prefix
-                                  << "Talkgroup filters for " << sys.short_name
-                                  << " allow=" << sys.tg_allow_raw.size()
-                                  << " deny=" << sys.tg_deny_raw.size();
+          log_plugin_info("  Talkgroup Filters:   allow=" +
+                          std::to_string(sys.tg_allow_raw.size()) +
+                          " deny=" +
+                          std::to_string(sys.tg_deny_raw.size()));
         }
 
         data.systems.push_back(sys);
+      } else {
+        log_plugin_info("Configured System:      " + sys.short_name + " [disabled]");
       }
     }
 
     if (data.systems.empty()) {
-      BOOST_LOG_TRIVIAL(error) << log_prefix << "No enabled systems configured";
+      log_plugin_error("No enabled systems configured");
       return 1;
     }
 
-    BOOST_LOG_TRIVIAL(info) << log_prefix
-                            << "Server: " << data.server
-                            << "\t Model: " << data.model;
+    log_plugin_info("Server:                 " + data.server);
+    log_plugin_info("Model:                  " + data.model);
+    log_plugin_info("Response Format:        " + data.response_format);
+    log_plugin_info("Audio Source:           " + data.audio_source);
+    log_plugin_info("Timeout Seconds:        " + std::to_string(data.timeout_seconds));
+    log_plugin_info("Enabled Systems:        " + std::to_string(data.systems.size()));
 
     return 0;
   }
 
   int init(Config *config, std::vector<Source *> sources, std::vector<System *> systems) override {
+    (void)sources;
     frequency_format = config->frequency_format;
-    std::string log_prefix = "\t[Whisper Transcribe]\t";
 
     for (auto &cfg_sys : data.systems) {
       bool found = false;
@@ -247,14 +404,11 @@ public:
       }
 
       if (!found) {
-        BOOST_LOG_TRIVIAL(error) << log_prefix
-                                 << "Configured shortName not found in loaded systems: "
-                                 << cfg_sys.short_name;
+        log_plugin_error("Configured shortName not found in loaded systems: " + cfg_sys.short_name);
         return 1;
       }
 
-      BOOST_LOG_TRIVIAL(info) << log_prefix
-                              << "Validated system: " << cfg_sys.short_name;
+      log_plugin_info("Validated System:       " + cfg_sys.short_name);
     }
 
     return 0;
@@ -265,6 +419,7 @@ public:
                          nlohmann::ordered_json &plugin_ctx) {
     CURL *curl = curl_easy_init();
     if (!curl) {
+      log_call_error(call_info, "Whisper Transcribe failed to initialize CURL");
       return 1;
     }
 
@@ -272,10 +427,25 @@ public:
     char curl_errbuf[CURL_ERROR_SIZE];
     curl_errbuf[0] = '\0';
 
-    const std::string audio_path =
-        call_info.compress_wav && !call_info.converted.empty()
-            ? call_info.converted
-            : call_info.filename;
+    std::string audio_path = call_info.filename;
+    std::string audio_source_used = "wav";
+
+    if (data.audio_source == "m4a") {
+      if (call_info.compress_wav && !call_info.converted.empty()) {
+        audio_path = call_info.converted;
+        audio_source_used = "m4a";
+      } else {
+        log_call_warn(call_info,
+                      "Whisper Transcribe audioSource is set to m4a, but no converted file is available; "
+                      "falling back to wav");
+      }
+    }
+
+    plugin_ctx["audio_source_requested"] = data.audio_source;
+    plugin_ctx["audio_source_used"] = audio_source_used;
+    plugin_ctx["audio_path"] = audio_path;
+    plugin_ctx["response_format"] = data.response_format;
+    plugin_ctx["model"] = data.model;
 
     curl_mime *mime = curl_mime_init(curl);
     curl_mimepart *part = nullptr;
@@ -288,10 +458,9 @@ public:
     curl_mime_name(part, "model");
     curl_mime_data(part, data.model.c_str(), CURL_ZERO_TERMINATED);
 
-    // Ask for detailed JSON if the service supports it
     part = curl_mime_addpart(mime);
     curl_mime_name(part, "response_format");
-    curl_mime_data(part, "verbose_json", CURL_ZERO_TERMINATED);
+    curl_mime_data(part, data.response_format.c_str(), CURL_ZERO_TERMINATED);
 
     if (!sys_cfg.language.empty()) {
       part = curl_mime_addpart(mime);
@@ -330,51 +499,67 @@ public:
     curl_easy_cleanup(curl);
 
     if (res != CURLE_OK || response_code < 200 || response_code >= 300) {
-      std::string loghdr = log_header(call_info.short_name, call_info.call_num,
-                                      call_info.talkgroup_display, call_info.freq);
-      BOOST_LOG_TRIVIAL(error) << loghdr
-                               << this->plugin_name
-                               << " transcript request failed (HTTP " << response_code << ") "
-                               << response_buffer
-                               << (curl_errbuf[0] ? std::string(" curl_err=") + curl_errbuf : "");
-      return 1;
-    }
-
-    nlohmann::json parsed = nlohmann::json::parse(response_buffer, nullptr, false);
-    if (parsed.is_discarded()) {
-      std::string loghdr = log_header(call_info.short_name, call_info.call_num,
-                                      call_info.talkgroup_display, call_info.freq);
-      BOOST_LOG_TRIVIAL(error) << loghdr
-                               << this->plugin_name
-                               << " transcript response was not valid JSON";
-      return 1;
-    }
-
-    plugin_ctx["transcript"] = parsed.value("text", "");
-    plugin_ctx["segments"] = nlohmann::ordered_json::array();
-    plugin_ctx["addresses"] = "";
-
-    if (sys_cfg.include_segments && parsed.contains("segments") && parsed["segments"].is_array()) {
-      for (const auto &seg : parsed["segments"]) {
-        nlohmann::ordered_json seg_json;
-        seg_json["id"] = seg.value("id", 0);
-        seg_json["start"] = seg.value("start", 0.0);
-        seg_json["end"] = seg.value("end", 0.0);
-        seg_json["text"] = seg.value("text", "");
-        plugin_ctx["segments"].push_back(seg_json);
+      std::ostringstream err;
+      err << "Whisper Transcribe transcript request failed (HTTP " << response_code << ")";
+      if (!response_buffer.empty()) {
+        err << " response=" << response_buffer;
       }
+      if (curl_errbuf[0]) {
+        err << " curl_err=" << curl_errbuf;
+      }
+      log_call_error(call_info, err.str());
+      return 1;
     }
+
+    plugin_ctx["transcript"] = "";
+    plugin_ctx["segments"] = nlohmann::ordered_json::array();
+
+    if (response_is_json_format(data.response_format)) {
+      nlohmann::json parsed = nlohmann::json::parse(response_buffer, nullptr, false);
+      if (parsed.is_discarded()) {
+        log_call_error(call_info,
+                       "Whisper Transcribe transcript response was not valid JSON for responseFormat=" +
+                       data.response_format);
+        return 1;
+      }
+
+      plugin_ctx["transcript"] = parsed.value("text", "");
+      plugin_ctx["raw_response"] = parsed;
+
+      if (sys_cfg.include_segments &&
+          parsed.contains("segments") &&
+          parsed["segments"].is_array()) {
+        for (const auto &seg : parsed["segments"]) {
+          nlohmann::ordered_json seg_json;
+          seg_json["id"] = seg.value("id", 0);
+          seg_json["start"] = seg.value("start", 0.0);
+          seg_json["end"] = seg.value("end", 0.0);
+          seg_json["text"] = seg.value("text", "");
+          if (seg.contains("speaker")) {
+            seg_json["speaker"] = seg["speaker"];
+          }
+          plugin_ctx["segments"].push_back(seg_json);
+        }
+      }
+    } else {
+      // text / srt / vtt
+      plugin_ctx["transcript"] = response_buffer;
+    }
+
+    log_call_info(call_info,
+                  "Whisper Transcribe transcript success"
+                  " source=" + audio_source_used +
+                  " responseFormat=" + data.response_format +
+                  " segments=" + std::to_string(plugin_ctx["segments"].size()));
 
     return 0;
   }
 
   int call_end(Call_Data_t &call_info, nlohmann::ordered_json &plugin_ctx) override {
-
     if (!plugin_ctx.is_object()) {
       plugin_ctx = nlohmann::ordered_json::object();
     }
 
-    // Stable output shape for all outcomes
     plugin_ctx["transcript"] = "";
     plugin_ctx["segments"] = nlohmann::ordered_json::array();
     plugin_ctx["process_time_seconds"] = 0.0;
@@ -382,6 +567,8 @@ public:
     plugin_ctx["skip_reason"] = "";
     plugin_ctx["success"] = false;
     plugin_ctx["error"] = "";
+    plugin_ctx["response_format"] = data.response_format;
+    plugin_ctx["model"] = data.model;
 
     Whisper_Transcribe_System *sys = get_system(call_info.short_name);
     if (!sys || !sys->enabled) {
@@ -397,24 +584,19 @@ public:
     }
 
     if (!passes_talkgroup_filter(sys, call_info.talkgroup)) {
-      std::string loghdr = log_header(call_info.short_name, call_info.call_num,
-                                      call_info.talkgroup_display, call_info.freq);
-
       plugin_ctx["skipped"] = true;
       plugin_ctx["skip_reason"] = "talkgroup_filter";
 
-      BOOST_LOG_TRIVIAL(info) << loghdr
-                              << this->plugin_name
-                              << " skipped transcription due to talkgroup filter (tg="
-                              << call_info.talkgroup << ")";
+      log_call_info(call_info,
+                    "Whisper Transcribe skipped transcription due to talkgroup filter (tg=" +
+                    std::to_string(call_info.talkgroup) + ")");
       return 0;
     }
 
     auto start = std::chrono::steady_clock::now();
-
     int rc = request_transcript(call_info, *sys, plugin_ctx);
-
     auto end = std::chrono::steady_clock::now();
+
     plugin_ctx["process_time_seconds"] =
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() / 1000.0;
 
@@ -426,7 +608,6 @@ public:
 
     return rc;
   }
-
 };
 
 BOOST_DLL_ALIAS(
