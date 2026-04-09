@@ -7,11 +7,23 @@
 #include "../../trunk-recorder/plugin_manager/plugin_api.h"
 #include "../../trunk-recorder/call_concluder/call_concluder.h"
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include <vector>
+
+struct TimeClip {
+  double start;
+  double end;
+};
+
+struct SpeechSegmentSource {
+  std::string plugin;
+  std::string key;
+};
 
 struct Whisper_Transcribe_System {
   std::string short_name;
@@ -33,6 +45,10 @@ struct Whisper_Transcribe_Data {
   std::string response_format;
   int timeout_seconds = 300;
   std::string audio_source = "wav";
+  bool include_raw_response = false;
+
+  std::vector<SpeechSegmentSource> speech_sources;
+  bool adjust_segment_timestamps = false;
 
   std::vector<Whisper_Transcribe_System> systems;
 };
@@ -272,6 +288,22 @@ public:
     data.model = config_data.value("model", "whisper-1");
     data.audio_source = config_data.value("audioSource", "wav");
     data.timeout_seconds = config_data.value("timeoutSeconds", 300);
+    data.include_raw_response = config_data.value("includeRawResponse", false);
+    data.adjust_segment_timestamps = config_data.value("adjustSegmentTimestamps", false);
+
+    if (config_data.contains("speechSegmentsSources") &&
+        config_data["speechSegmentsSources"].is_array()) {
+      for (const auto &src : config_data["speechSegmentsSources"]) {
+        SpeechSegmentSource s;
+        s.plugin = src.value("plugin", "");
+        s.key = src.value("key", "speech_segments");
+        boost::algorithm::trim(s.plugin);
+        boost::algorithm::trim(s.key);
+        if (!s.plugin.empty()) {
+          data.speech_sources.push_back(s);
+        }
+      }
+    }
 
     if (config_data.contains("responseFormat")) {
       data.response_format = config_data.value("responseFormat", "");
@@ -384,6 +416,14 @@ public:
     log_plugin_info("Response Format:        " + data.response_format);
     log_plugin_info("Audio Source:           " + data.audio_source);
     log_plugin_info("Timeout Seconds:        " + std::to_string(data.timeout_seconds));
+    log_plugin_info("Include Raw Response:   " + bool_to_string(data.include_raw_response));
+    if (!data.speech_sources.empty()) {
+      log_plugin_info("Clip Timestamp Sources: " + std::to_string(data.speech_sources.size()));
+      for (const auto &src : data.speech_sources) {
+        log_plugin_info("  Source plugin=" + src.plugin + " key=" + src.key);
+      }
+      log_plugin_info("Adjust Timestamps:      " + bool_to_string(data.adjust_segment_timestamps));
+    }
     log_plugin_info("Enabled Systems:        " + std::to_string(data.systems.size()));
 
     return 0;
@@ -414,6 +454,97 @@ public:
     return 0;
   }
 
+  // Returns the intersection of keep-segments from all configured sources.
+  // Each source says "keep this audio"; we only pass audio that ALL sources want to keep.
+  std::vector<TimeClip> get_speech_clips(const Call_Data_t &call_info) const {
+    if (data.speech_sources.empty()) return {};
+
+    std::vector<std::vector<TimeClip>> all_clips;
+
+    for (const auto &src : data.speech_sources) {
+      if (!call_info.call_json.contains(src.plugin)) continue;
+      const auto &plugin_data = call_info.call_json[src.plugin];
+      if (!plugin_data.contains(src.key)) continue;
+      const auto &segs = plugin_data[src.key];
+      if (!segs.is_array()) continue;
+
+      std::vector<TimeClip> clips;
+      for (const auto &seg : segs) {
+        if (!seg.contains("start") || !seg.contains("end")) continue;
+        double s = seg["start"].get<double>();
+        double e = seg["end"].get<double>();
+        if (e > s) clips.push_back({s, e});
+      }
+
+      std::sort(clips.begin(), clips.end(),
+                [](const TimeClip &a, const TimeClip &b) { return a.start < b.start; });
+
+      if (!clips.empty()) all_clips.push_back(std::move(clips));
+    }
+
+    if (all_clips.empty()) return {};
+
+    std::vector<TimeClip> result = all_clips[0];
+    for (size_t i = 1; i < all_clips.size(); ++i) {
+      result = intersect_clips(result, all_clips[i]);
+      if (result.empty()) break;
+    }
+    return result;
+  }
+
+  static std::vector<TimeClip> intersect_clips(const std::vector<TimeClip> &a,
+                                               const std::vector<TimeClip> &b) {
+    std::vector<TimeClip> result;
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+      double start = std::max(a[i].start, b[j].start);
+      double end   = std::min(a[i].end,   b[j].end);
+      if (end > start) result.push_back({start, end});
+      if (a[i].end < b[j].end) ++i; else ++j;
+    }
+    return result;
+  }
+
+  static std::string build_clip_timestamps_str(const std::vector<TimeClip> &clips) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(3);
+    for (size_t i = 0; i < clips.size(); ++i) {
+      if (i > 0) oss << ",";
+      oss << clips[i].start << "," << clips[i].end;
+    }
+    return oss.str();
+  }
+
+  // Corrects segment timestamps from concatenation-relative back to original audio time.
+  // Use when the server processes clips by concatenating them and resetting timestamps to 0,
+  // rather than preserving original audio positions (e.g. whisper.cpp preserves them; some
+  // other servers do not).
+  static void adjust_timestamps_to_absolute(nlohmann::ordered_json &segments,
+                                            const std::vector<TimeClip> &clips) {
+    // Build cumulative start offsets in the concatenated timeline.
+    std::vector<double> cum_starts;
+    double acc = 0.0;
+    for (const auto &clip : clips) {
+      cum_starts.push_back(acc);
+      acc += clip.end - clip.start;
+    }
+
+    for (auto &seg : segments) {
+      double seg_start = seg.value("start", 0.0);
+      double seg_end   = seg.value("end",   0.0);
+
+      // Find which clip this segment belongs to by its position in concatenated time.
+      size_t ci = clips.size() - 1;
+      for (size_t i = 0; i + 1 < clips.size(); ++i) {
+        if (seg_start < cum_starts[i + 1]) { ci = i; break; }
+      }
+
+      double offset = clips[ci].start - cum_starts[ci];
+      seg["start"] = seg_start + offset;
+      seg["end"]   = seg_end   + offset;
+    }
+  }
+
   int request_transcript(const Call_Data_t &call_info,
                          const Whisper_Transcribe_System &sys_cfg,
                          nlohmann::ordered_json &plugin_ctx) {
@@ -441,11 +572,28 @@ public:
       }
     }
 
+    // audio_path metadata: final archive path when archiving, otherwise bare filename
+    std::string audio_path_meta;
+    if (call_info.audio_archive) {
+      audio_path_meta = call_info.final_filename;
+    } else {
+      const size_t sep = call_info.filename.rfind('/');
+      audio_path_meta = (sep == std::string::npos) ? call_info.filename : call_info.filename.substr(sep + 1);
+    }
+
     plugin_ctx["audio_source_requested"] = data.audio_source;
     plugin_ctx["audio_source_used"] = audio_source_used;
-    plugin_ctx["audio_path"] = audio_path;
+    plugin_ctx["audio_path"] = audio_path_meta;
     plugin_ctx["response_format"] = data.response_format;
     plugin_ctx["model"] = data.model;
+
+    std::vector<TimeClip> clips = get_speech_clips(call_info);
+    std::string clip_timestamps_str;
+    if (!clips.empty()) {
+      clip_timestamps_str = build_clip_timestamps_str(clips);
+      plugin_ctx["clip_timestamps"] = clip_timestamps_str;
+      plugin_ctx["clip_count"] = clips.size();
+    }
 
     curl_mime *mime = curl_mime_init(curl);
     curl_mimepart *part = nullptr;
@@ -472,6 +620,12 @@ public:
       part = curl_mime_addpart(mime);
       curl_mime_name(part, "prompt");
       curl_mime_data(part, sys_cfg.prompt.c_str(), CURL_ZERO_TERMINATED);
+    }
+
+    if (!clip_timestamps_str.empty()) {
+      part = curl_mime_addpart(mime);
+      curl_mime_name(part, "clip_timestamps");
+      curl_mime_data(part, clip_timestamps_str.c_str(), CURL_ZERO_TERMINATED);
     }
 
     struct curl_slist *headers = nullptr;
@@ -524,7 +678,9 @@ public:
       }
 
       plugin_ctx["transcript"] = parsed.value("text", "");
-      plugin_ctx["raw_response"] = parsed;
+      if (data.include_raw_response) {
+        plugin_ctx["raw_response"] = parsed;
+      }
 
       if (sys_cfg.include_segments &&
           parsed.contains("segments") &&
@@ -539,6 +695,11 @@ public:
             seg_json["speaker"] = seg["speaker"];
           }
           plugin_ctx["segments"].push_back(seg_json);
+        }
+
+        if (data.adjust_segment_timestamps && !clips.empty() &&
+            !plugin_ctx["segments"].empty()) {
+          adjust_timestamps_to_absolute(plugin_ctx["segments"], clips);
         }
       }
     } else {
